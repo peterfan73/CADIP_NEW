@@ -228,10 +228,10 @@ def parse_reconstruct_xml(filepath, logger):
         }
 
     if result['status_63'] is None:
-        logger.error(
-            "No Status VCID=63 found in {}".format(filepath)
+        logger.warning(
+            "No Status VCID=63 found in {} — defaulting to zero idle frames".format(filepath)
         )
-        return None
+        result['status_63'] = {'NumFrames': 0, 'RsUncorrectable': 0, 'RsCorrectable': 0}
     if result['summary'] is None:
         logger.error("No Summary found in {}".format(filepath))
         return None
