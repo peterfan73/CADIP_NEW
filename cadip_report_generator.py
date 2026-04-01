@@ -146,7 +146,7 @@ def mark_as_processed(entries, folder_name):
 # ---------------------------------------------------------------------------
 
 # Pattern: SXY_ followed by 8 alphanumeric characters
-FOLDER_PATTERN = re.compile(r'^S[12][A-D]_[A-Za-z0-9]{8}$')
+FOLDER_PATTERN = re.compile(r'^S[12][A-D]_[A-Za-z0-9]{9}$')
 
 
 def scan_acquisition_folders(reports_source, processed, logger):
@@ -214,7 +214,8 @@ def parse_reconstruct_xml(filepath, logger):
             break
 
     # Find Summary
-    summary_elem = root.find('.//Summary')
+    all_summaries = root.findall('.//Summary')
+    summary_elem = all_summaries[-1] if all_summaries else None
     if summary_elem is not None:
         result['summary'] = {
             'NumFrames': int(summary_elem.findtext('NumFrames', '0')),
@@ -227,10 +228,10 @@ def parse_reconstruct_xml(filepath, logger):
         }
 
     if result['status_63'] is None:
-        logger.error(
-            "No Status VCID=63 found in {}".format(filepath)
+        logger.warning(
+            "No Status VCID=63 found in {} — defaulting to zero idle frames".format(filepath)
         )
-        return None
+        result['status_63'] = {'NumFrames': 0, 'RsUncorrectable': 0, 'RsCorrectable': 0}
     if result['summary'] is None:
         logger.error("No Summary found in {}".format(filepath))
         return None
