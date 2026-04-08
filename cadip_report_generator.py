@@ -4,7 +4,7 @@ CADIP Report Generator — Scans acquisition folders, parses XML reports,
 and generates REP_PASS EOF files for upload to inta-ddp.
 
 Pipeline:
-  /disk3/distribution/reports/SXY_xxxxxxxx/
+  /disk3/reports/SXY_xxxxxxxx/
     ├── reconstruct_xband1_ch1_VCDU1.xml  ──┐
     ├── reconstruct_xband2_ch2_VCDU1.xml  ──┤── parse → EOF file → IN/
     └── DCS_0n_Sxy_..._DSIB.xml          ──┘
@@ -152,6 +152,8 @@ FOLDER_PATTERN = re.compile(r'^S[12][A-D]_[A-Za-z0-9]{9}$')
 def scan_acquisition_folders(reports_source, processed, logger):
     """
     Scan the reports source directory for new SXY_xxxxxxxx folders.
+    Only considers folders modified within the last 3 days to avoid
+    reprocessing old folders that were purged from processed_folders.txt.
     Returns list of full paths of new (unprocessed) folders.
     """
     if not os.path.isdir(reports_source):
@@ -160,17 +162,23 @@ def scan_acquisition_folders(reports_source, processed, logger):
         )
         return []
 
-    new_folders = []
-    for entry in sorted(os.listdir(reports_source)):
-        full_path = os.path.join(reports_source, entry)
-        if not os.path.isdir(full_path):
-            continue
-        if not FOLDER_PATTERN.match(entry):
-            continue
-        if entry in processed:
-            continue
-        new_folders.append(full_path)
+    cutoff_ts = (
+        datetime.now(timezone.utc) - timedelta(days=3)
+    ).timestamp()
 
+    new_folders = []
+    for entry in os.scandir(reports_source):
+        if not entry.is_dir():
+            continue
+        if not FOLDER_PATTERN.match(entry.name):
+            continue
+        if entry.stat().st_mtime < cutoff_ts:
+            continue
+        if entry.name in processed:
+            continue
+        new_folders.append(entry.path)
+
+    new_folders.sort()
     return new_folders
 
 
