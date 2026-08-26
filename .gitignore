@@ -1,2 +1,7 @@
-  # Python                                                                                 
-  __pycache__/
+# Python
+__pycache__/
+*.pyc
+
+# Local working directories — sample folders, generated reports, run logs
+exchange/
+outputs/
