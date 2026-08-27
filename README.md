@@ -67,7 +67,7 @@ If the DDP server detects a problem with a received file, it creates a `*_BAD` m
 ├── cadip_report_generator.py  ← report generation logic
 ├── cadip_upload.py            ← FTP upload logic
 ├── cadip.ini                  ← configuration
-├── processed_folders.txt      ← tracks processed acquisitions (auto-generated)
+├── processed_folders.txt      ← pass index: folder state + satellite/orbit (auto-generated)
 ├── IN/                        ← generated EOF files (pending MD5 processing)
 ├── MD5/                       ← files renamed with MD5 hash (pending upload)
 ├── Sent_DDP/                  ← successfully uploaded files (archive)
@@ -96,7 +96,7 @@ lock_file = %(cadip_base)s/cadip_upload.lock   # Prevents overlapping runs
 
 [report_generator]
 reports_source = /disk3/reports    # Where acquisition folders appear
-processed_file = /home/meos/bin/cadip/processed_folders.txt  # Tracking file
+processed_file = /home/meos/bin/cadip/processed_folders.txt  # Pass index
 station_id = MPS                                # Station identifier for filenames
 
 [remote]
@@ -110,6 +110,22 @@ target_path_template = WebReports/DFEP{unit}/   # {unit} replaced by processing 
 ### Input: Acquisition Folder
 
 Each satellite pass creates a folder named `SXY_xxxxxxxx` (e.g. `S1A_AI3B9n44`) in the reports source directory, where `XY` is the satellite mission (1A, 1C, 1D, 2A, 2B, 2C, 2D).
+
+A pass does **not** always land in a single folder. Demodulation writes the
+`reconstruct_*.xml` files; distribution writes the DSIB. When the acquiring DFEP
+cannot deliver to the DDP, those two steps end up in different folders:
+
+| folder | contents | meaning |
+|---|---|---|
+| `SXY_xxxxxxxxx` | both `reconstruct_*.xml`, DSIB | nominal — one report, generated immediately |
+| `SXY_xxxxxxxxx` | both `reconstruct_*.xml`, no DSIB | demodulated but never distributed |
+| `SXY_xxxxxxxxx` | DSIB only, one per channel | a retransfer of that pass |
+
+A retransfer therefore carries the pass window but no frame statistics, and the
+acquisition it belongs to carries frame statistics but no pass window. The
+generator joins them via the pass index (below) and emits one report covering
+both channels — which is what the DDP application expects, since it reads
+`data_C1` and `data_C2` from a single matched file.
 
 ### XML Parsing
 
@@ -211,11 +227,35 @@ A PID-based lock file (`cadip_upload.lock`) prevents overlapping runs when cron 
 
 Acquisition folders are created when a pass starts, but XML files only appear after the acquisition completes (several minutes later). The pipeline handles this gracefully:
 
-- If required files are missing, the folder is **skipped with a warning**
-- It is **not marked as processed**, so it will be retried on the next run
-- Once all files appear, processing succeeds and the folder is marked as done
+- If required files are missing, the folder is left **pending** and looked at again on the next run
+- A folder that cannot yet produce a report is reported **once**, not on every run of the two-minute cron
+- Once all files appear, processing succeeds and the folder is marked **done**
 
-Processed folders are tracked in `processed_folders.txt` with automatic cleanup of entries older than 3 days.
+### The pass index
+
+`processed_folders.txt` is a state table, not just a list of names:
+
+```
+timestamp|folder|satellite|orbit|kind|state|eof
+2026-08-26T08:19:41Z|S1D_IX6B9n441|S1D|4294|acquisition|pending|
+2026-08-26T08:37:12Z|S1D_G17B9n441|S1D|4294|distribution|done|S1D_OPER_REP_PASS_4_MPS__...EOF
+```
+
+Recording satellite and orbit is what lets a retransfer find its acquisition
+directly, without rescanning and re-parsing the whole directory. Two-field
+lines from the previous format are still read, as `legacy`/`done`.
+
+Rows are dropped **when their folder disappears from disk**, not on a timer.
+There is deliberately no age limit: a retransfer may follow its acquisition by
+minutes, hours or days, and the acquisition row has to still be there to supply
+the frame statistics. This also removes the need for the old modification-time
+cutoff in the scanner — entries can no longer expire out from under a folder
+that still exists, so a stale folder cannot be re-detected as new.
+
+The one terminal failure is a retransfer whose acquisition folder is no longer
+on disk. Nothing can be built from it, so it is logged once as an error and
+marked done. That puts a real ceiling on how late a retransfer can arrive: the
+retention of `reports_source` itself.
 
 ---
 

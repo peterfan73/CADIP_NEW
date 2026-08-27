@@ -23,7 +23,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -92,69 +92,145 @@ def setup_logging(ftp_results_dir):
 
 
 # ---------------------------------------------------------------------------
-# Processed folders tracking
+# Pass index (formerly the flat processed-folders list)
 # ---------------------------------------------------------------------------
+#
+# A pass does not always land in one folder. When the acquiring DFEP cannot
+# deliver, it leaves behind a folder holding only the demodulation output, and
+# the later retransfer writes one further folder *per channel* holding only the
+# DSIB. Neither half can produce a report on its own, so the index records the
+# satellite and orbit of every folder seen and lets a retransfer find the
+# acquisition it belongs to without rescanning and re-parsing the directory.
+#
+# Line format:  timestamp|folder|satellite|orbit|kind|state|eof
+# Legacy two-field lines (timestamp|folder) are still read, as done/legacy.
 
-def load_processed_folders(processed_file, logger):
-    """
-    Load the processed folders file. Each line is: timestamp|folder_name
-    Purges entries older than 3 days.
-    Returns a dict of {folder_name: timestamp_str}.
-    """
-    entries = {}
-    cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+KIND_COMPLETE = 'complete'          # reconstructs + DSIB together — nominal
+KIND_ACQUISITION = 'acquisition'    # reconstructs only — demodulated, not distributed
+KIND_DISTRIBUTION = 'distribution'  # DSIB only — distributed, not demodulated
+KIND_UNKNOWN = 'unknown'            # nothing recognisable yet, probably mid-write
+KIND_LEGACY = 'legacy'              # carried over from the old file format
 
+STATE_DONE = 'done'                 # nothing further to do with this folder
+STATE_PENDING = 'pending'           # revisit on later runs
+
+
+def load_index(processed_file, reports_source, logger):
+    """
+    Load the pass index.
+
+    A row is dropped only when its folder no longer exists under
+    reports_source, so the index lives exactly as long as the data it points
+    at. There is deliberately no age-based purge: a retransfer may follow its
+    acquisition by minutes, hours or days, and the acquisition row has to
+    still be there to supply the frame statistics.
+
+    Returns {folder_name: row_dict}.
+    """
+    rows = {}
     if not os.path.isfile(processed_file):
-        return entries
+        return rows
+
+    # Only purge while the source directory is actually readable. If the mount
+    # is missing, keeping the index intact is far better than emptying it and
+    # reprocessing every folder on the next run.
+    source_readable = os.path.isdir(reports_source)
+    dropped = 0
 
     with open(processed_file, 'r') as f:
         for line in f:
             line = line.strip()
             if not line or '|' not in line:
                 continue
-            parts = line.split('|', 1)
-            try:
-                ts = datetime.strptime(parts[0], "%Y-%m-%dT%H:%M:%SZ")
-                ts = ts.replace(tzinfo=timezone.utc)
-                if ts >= cutoff:
-                    entries[parts[1]] = parts[0]
-                else:
-                    logger.debug(
-                        "Purging old entry: {}".format(parts[1])
-                    )
-            except ValueError:
+            parts = line.split('|')
+            if len(parts) < 2:
                 continue
+            row = {
+                'timestamp': parts[0],
+                'folder': parts[1],
+                'satellite': parts[2] if len(parts) > 2 else '',
+                'orbit': parts[3] if len(parts) > 3 else '',
+                'kind': parts[4] if len(parts) > 4 else KIND_LEGACY,
+                'state': parts[5] if len(parts) > 5 else STATE_DONE,
+                'eof': parts[6] if len(parts) > 6 else '',
+            }
+            if source_readable and not os.path.isdir(
+                    os.path.join(reports_source, row['folder'])):
+                dropped += 1
+                continue
+            rows[row['folder']] = row
 
-    return entries
+    if dropped:
+        logger.debug(
+            "Dropped {} index row(s) whose folder is gone".format(dropped)
+        )
+    return rows
 
 
-def save_processed_folders(processed_file, entries):
-    """Save the processed folders dict back to file."""
+def save_index(processed_file, rows):
+    """Write the pass index back to disk."""
     with open(processed_file, 'w') as f:
-        for folder_name, ts in sorted(entries.items()):
-            f.write("{}|{}\n".format(ts, folder_name))
+        for folder_name in sorted(rows):
+            r = rows[folder_name]
+            f.write("{}|{}|{}|{}|{}|{}|{}\n".format(
+                r['timestamp'], r['folder'], r['satellite'], r['orbit'],
+                r['kind'], r['state'], r['eof'],
+            ))
 
 
-def mark_as_processed(entries, folder_name):
-    """Add a folder to the processed entries dict."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entries[folder_name] = now
+def index_row(rows, folder_name, satellite='', orbit='',
+              kind=KIND_UNKNOWN, state=STATE_PENDING, eof=''):
+    """Insert or update a row, refreshing its timestamp."""
+    rows[folder_name] = {
+        'timestamp': datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        'folder': folder_name,
+        'satellite': satellite or '',
+        'orbit': str(orbit or ''),
+        'kind': kind,
+        'state': state,
+        'eof': eof or '',
+    }
+
+
+def find_acquisition_folder(rows, satellite, orbit, reports_source):
+    """
+    Find the indexed folder holding the demodulation output for this pass.
+
+    Returns the folder name, or None. Rows are only kept while their folder
+    exists, but the reconstruct XMLs are checked again here because the folder
+    may have been pruned between runs.
+    """
+    for folder_name in sorted(rows):
+        row = rows[folder_name]
+        if row['satellite'] != satellite or row['orbit'] != str(orbit):
+            continue
+        if row['kind'] not in (KIND_ACQUISITION, KIND_COMPLETE):
+            continue
+        found = classify_folder(os.path.join(reports_source, folder_name))
+        if found['ch1'] and found['ch2']:
+            return folder_name
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Folder scanning
+# Folder scanning and classification
 # ---------------------------------------------------------------------------
 
 # Pattern: SXY_ followed by 9 alphanumeric characters
 FOLDER_PATTERN = re.compile(r'^S[12][A-D]_[A-Za-z0-9]{9}$')
 
+CH1_RECONSTRUCT = 'reconstruct_xband1_ch1_VCDU1.xml'
+CH2_RECONSTRUCT = 'reconstruct_xband2_ch2_VCDU1.xml'
 
-def scan_acquisition_folders(reports_source, processed, logger):
+
+def scan_acquisition_folders(reports_source, rows, logger):
     """
-    Scan the reports source directory for new SXY_xxxxxxxxx folders.
-    Only considers folders modified within the last 3 days to avoid
-    reprocessing old folders that were purged from processed_folders.txt.
-    Returns list of full paths of new (unprocessed) folders.
+    Return the folders worth looking at this run: every SXY_xxxxxxxxx folder
+    not yet indexed, plus indexed ones still marked pending.
+
+    There is no modification-time cutoff. Index rows now disappear only when
+    their folder does, so an old folder can never be re-detected as new —
+    which is the duplicate-report problem the cutoff was working around.
     """
     if not os.path.isdir(reports_source):
         logger.error(
@@ -162,24 +238,47 @@ def scan_acquisition_folders(reports_source, processed, logger):
         )
         return []
 
-    cutoff_ts = (
-        datetime.now(timezone.utc) - timedelta(days=3)
-    ).timestamp()
-
-    new_folders = []
+    folders = []
     for entry in os.scandir(reports_source):
         if not entry.is_dir():
             continue
         if not FOLDER_PATTERN.match(entry.name):
             continue
-        if entry.stat().st_mtime < cutoff_ts:
+        row = rows.get(entry.name)
+        if row is not None and row['state'] == STATE_DONE:
             continue
-        if entry.name in processed:
-            continue
-        new_folders.append(entry.path)
+        folders.append(entry.path)
 
-    new_folders.sort()
-    return new_folders
+    folders.sort()
+    return folders
+
+
+def classify_folder(folder_path):
+    """
+    Describe a folder by what it holds. See the pass-index note above for why
+    the three partial shapes exist.
+    """
+    ch1 = os.path.join(folder_path, CH1_RECONSTRUCT)
+    ch2 = os.path.join(folder_path, CH2_RECONSTRUCT)
+    has_ch1 = os.path.isfile(ch1)
+    has_ch2 = os.path.isfile(ch2)
+    dsibs = sorted(glob.glob(os.path.join(folder_path, 'DCS_0*_DSIB.xml')))
+
+    if has_ch1 and has_ch2 and dsibs:
+        kind = KIND_COMPLETE
+    elif has_ch1 or has_ch2:
+        kind = KIND_ACQUISITION
+    elif dsibs:
+        kind = KIND_DISTRIBUTION
+    else:
+        kind = KIND_UNKNOWN
+
+    return {
+        'kind': kind,
+        'ch1': ch1 if has_ch1 else None,
+        'ch2': ch2 if has_ch2 else None,
+        'dsibs': dsibs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -298,68 +397,76 @@ def format_time_for_filename(iso_time):
 # Extract folder metadata
 # ---------------------------------------------------------------------------
 
-def extract_folder_metadata(folder_path, logger):
+def read_reconstruct_identity(filepath, logger):
+    """Satellite name and orbit from a reconstruct XML (<Name>, <Orbit>)."""
+    try:
+        root = ET.parse(filepath).getroot()
+    except ET.ParseError as e:
+        logger.error("Failed to parse {}: {}".format(filepath, e))
+        return None, None
+    return root.findtext('Name'), root.findtext('Orbit')
+
+
+def read_dsib_identity(filepath, logger):
     """
-    From an acquisition folder, extract:
-      - satellite mission (e.g. '1A')
-      - DFEP unit number (e.g. '4')
-      - time_start, time_stop from DCS
-      - channel 1 and 2 data from reconstruct XMLs
+    Satellite, orbit and DFEP unit from a DSIB filename.
+
+    Two layouts are in use and both occur in the field:
+        DCS_04_S2B_20260410112241_47496_ch1_DSIB.xml   time and orbit separate
+        DCS_04_S1D_20260826081034004294_ch1_DSIB.xml   fused, orbit = last 6
+
+    <session_id> inside the file carries the fused form too, but it is empty in
+    some reports, so the filename is the source of truth here.
+
+    Returns (satellite, orbit, unit) or (None, None, None).
+    """
+    name = os.path.basename(filepath)
+    parts = name.split('_')
+    if len(parts) < 5 or not parts[1].isdigit():
+        logger.error("Unrecognised DSIB filename: {}".format(name))
+        return None, None, None
+
+    unit_number = str(int(parts[1]))
+    satellite = parts[2]
+    middle = parts[3:-2]      # fields between the satellite and _chN_DSIB.xml
+
+    orbit = None
+    if len(middle) == 1 and len(middle[0]) == 20 and middle[0].isdigit():
+        orbit = str(int(middle[0][14:]))
+    elif len(middle) >= 2 and middle[-1].isdigit():
+        orbit = str(int(middle[-1]))
+
+    if orbit is None:
+        logger.error(
+            "Cannot derive orbit from DSIB filename: {}".format(name)
+        )
+        return None, None, None
+
+    return satellite, orbit, unit_number
+
+
+def build_metadata(satellite, unit_number, dsib_path, ch1_path, ch2_path,
+                   logger):
+    """
+    Assemble the three inputs a REP_PASS needs, wherever they happen to live:
+    frame statistics per channel from the reconstruct XMLs, pass window and
+    DFEP unit from the DSIB. For a nominal pass all three come from one
+    folder; for a retransfer the DSIB comes from a different folder than the
+    reconstruct XMLs.
 
     Returns dict with all metadata, or None on error.
     """
-    folder_name = os.path.basename(folder_path)
-
-    # Extract satellite mission from folder name: S1A_xxxxxxxx → '1A'
-    mission = folder_name[1:3]
-
-    # Find reconstruct XML files
-    ch1_files = glob.glob(
-        os.path.join(folder_path, 'reconstruct_xband1_ch1_VCDU1.xml')
-    )
-    ch2_files = glob.glob(
-        os.path.join(folder_path, 'reconstruct_xband2_ch2_VCDU1.xml')
-    )
-
-    if not ch1_files or not ch2_files:
-        logger.error(
-            "Missing reconstruct XML files in {}".format(folder_path)
-        )
-        return None
-
-    # Find DCS file — pattern: DCS_0n_Sxy_*_DSIB.xml
-    dcs_files = glob.glob(
-        os.path.join(folder_path, 'DCS_0*_DSIB.xml')
-    )
-    if not dcs_files:
-        logger.error("No DCS DSIB file found in {}".format(folder_path))
-        return None
-
-    dcs_file = dcs_files[0]
-
-    # Extract unit number from DCS filename: DCS_04_... → '4'
-    dcs_basename = os.path.basename(dcs_file)
-    unit_match = re.match(r'DCS_0(\d)_', dcs_basename)
-    if not unit_match:
-        logger.error(
-            "Cannot extract unit number from {}".format(dcs_basename)
-        )
-        return None
-    unit_number = unit_match.group(1)
-
-    # Parse reconstruct XMLs
-    ch1_data = parse_reconstruct_xml(ch1_files[0], logger)
-    ch2_data = parse_reconstruct_xml(ch2_files[0], logger)
+    ch1_data = parse_reconstruct_xml(ch1_path, logger)
+    ch2_data = parse_reconstruct_xml(ch2_path, logger)
     if not ch1_data or not ch2_data:
         return None
 
-    # Parse DCS XML
-    dcs_data = parse_dcs_xml(dcs_file, logger)
+    dcs_data = parse_dcs_xml(dsib_path, logger)
     if not dcs_data:
         return None
 
     return {
-        'mission': mission,
+        'mission': satellite[1:3],
         'unit_number': unit_number,
         'time_start': dcs_data['time_start'],
         'time_stop': dcs_data['time_stop'],
@@ -467,36 +574,165 @@ def write_eof_file(root_elem, output_path, logger):
 # Main processing
 # ---------------------------------------------------------------------------
 
-def process_folder(folder_path, in_dir, station_id, logger):
-    """
-    Process a single acquisition folder:
-      1. Parse XMLs
-      2. Generate REP_PASS XML
-      3. Write EOF file to IN/
-
-    Returns the generated EOF filename, or None on error.
-    """
-    folder_name = os.path.basename(folder_path)
-    logger.info("Processing: {}".format(folder_name))
-
-    # Extract all metadata
-    metadata = extract_folder_metadata(folder_path, logger)
-    if not metadata:
-        logger.error(
-            "  Failed to extract metadata from {}".format(folder_name)
-        )
-        return None
-
-    # Generate XML content
+def generate_report(metadata, in_dir, station_id, logger):
+    """Build the REP_PASS XML and write it to IN/. Returns the EOF filename."""
     root_elem = generate_eof_xml(metadata)
-
-    # Build filename and write
     eof_filename = build_eof_filename(metadata, station_id)
     os.makedirs(in_dir, exist_ok=True)
-    output_path = os.path.join(in_dir, eof_filename)
-    write_eof_file(root_elem, output_path, logger)
-
+    write_eof_file(root_elem, os.path.join(in_dir, eof_filename), logger)
     return eof_filename
+
+
+def _announce(rows, folder_name, kind, message, logger):
+    """
+    Log a folder's state only when it is new or has changed.
+
+    Folders that cannot yet produce a report stay pending indefinitely — by
+    design, since a retransfer has no deadline — so an unconditional message
+    here would repeat on every run of the two-minute cron.
+    """
+    previous = rows.get(folder_name)
+    if previous is None or previous['kind'] != kind:
+        logger.info(message)
+
+
+def _handle_acquisition_side(folder_path, info, rows, in_dir, station_id,
+                             dry_run, logger):
+    """
+    Handle a folder that carries demodulation output. Returns 1 if a report
+    was generated, 0 otherwise.
+    """
+    folder_name = os.path.basename(folder_path)
+
+    satellite = orbit = None
+    for path in (info['ch1'], info['ch2']):
+        if path:
+            satellite, orbit = read_reconstruct_identity(path, logger)
+            if satellite and orbit:
+                break
+
+    if not satellite or not orbit:
+        logger.error("Cannot identify the pass in {}".format(folder_name))
+        index_row(rows, folder_name, kind=info['kind'], state=STATE_PENDING)
+        return 0
+
+    if info['kind'] == KIND_ACQUISITION:
+        # Demodulated but not distributed. Nothing to report yet: either a DSIB
+        # lands in this folder later (nominal), or a retransfer folder appears
+        # and borrows these frame statistics. Pending serves both.
+        _announce(rows, folder_name, KIND_ACQUISITION,
+                  "Indexed acquisition {} ({} orbit {}) — no DSIB yet".format(
+                      folder_name, satellite, orbit), logger)
+        index_row(rows, folder_name, satellite, orbit,
+                  KIND_ACQUISITION, STATE_PENDING)
+        return 0
+
+    # KIND_COMPLETE — the nominal case, everything in one folder.
+    dsib_path = info['dsibs'][0]
+    _, _, unit_number = read_dsib_identity(dsib_path, logger)
+    if not unit_number:
+        index_row(rows, folder_name, satellite, orbit,
+                  KIND_COMPLETE, STATE_PENDING)
+        return 0
+
+    if dry_run:
+        logger.info("  Would generate report for {} orbit {} ({})".format(
+            satellite, orbit, folder_name))
+        return 0
+
+    logger.info("Processing: {}".format(folder_name))
+    metadata = build_metadata(satellite, unit_number, dsib_path,
+                              info['ch1'], info['ch2'], logger)
+    if not metadata:
+        logger.error("  Failed to extract metadata from {}".format(folder_name))
+        index_row(rows, folder_name, satellite, orbit,
+                  KIND_COMPLETE, STATE_PENDING)
+        return 0
+
+    eof_filename = generate_report(metadata, in_dir, station_id, logger)
+    index_row(rows, folder_name, satellite, orbit,
+              KIND_COMPLETE, STATE_DONE, eof_filename)
+    return 1
+
+
+def _handle_retransfers(classified, rows, reports_source, in_dir, station_id,
+                        dry_run, logger):
+    """
+    Resolve retransfer folders against the acquisition they belong to.
+
+    A retransfer writes one folder per channel and both carry the same session,
+    pass window and unit — only data_size differs — so the pair yields a single
+    report. Grouping is per run: a genuinely new retransfer of the same pass
+    later on arrives in new folders and correctly produces a fresh report.
+    """
+    groups = {}
+    for folder_path, info in classified:
+        if info['kind'] != KIND_DISTRIBUTION:
+            continue
+        folder_name = os.path.basename(folder_path)
+        dsib_path = info['dsibs'][0]
+        satellite, orbit, unit_number = read_dsib_identity(dsib_path, logger)
+        if not satellite:
+            index_row(rows, folder_name, kind=KIND_DISTRIBUTION,
+                      state=STATE_PENDING)
+            continue
+        groups.setdefault((satellite, orbit, unit_number), []).append(
+            (folder_name, dsib_path)
+        )
+
+    generated = 0
+    for (satellite, orbit, unit_number), members in sorted(groups.items()):
+        folder_names = sorted(m[0] for m in members)
+        dsib_path = members[0][1]
+        joined = ", ".join(folder_names)
+
+        acq_folder = find_acquisition_folder(
+            rows, satellite, orbit, reports_source
+        )
+        if acq_folder is None:
+            # Terminal: without the demodulation output there is no report to
+            # build, and no amount of waiting will produce one.
+            logger.error(
+                "Retransfer {} orbit {} ({}): no acquisition folder with "
+                "demodulation output for this pass — cannot build a "
+                "report".format(satellite, orbit, joined)
+            )
+            for folder_name in folder_names:
+                index_row(rows, folder_name, satellite, orbit,
+                          KIND_DISTRIBUTION, STATE_DONE)
+            continue
+
+        if dry_run:
+            logger.info(
+                "  Would generate retransfer report for {} orbit {} "
+                "from {} + {}".format(satellite, orbit, acq_folder, joined)
+            )
+            continue
+
+        acq_info = classify_folder(os.path.join(reports_source, acq_folder))
+        metadata = build_metadata(satellite, unit_number, dsib_path,
+                                  acq_info['ch1'], acq_info['ch2'], logger)
+        if not metadata:
+            logger.error(
+                "Retransfer {} orbit {} ({}): failed to build metadata "
+                "from {}".format(satellite, orbit, joined, acq_folder)
+            )
+            for folder_name in folder_names:
+                index_row(rows, folder_name, satellite, orbit,
+                          KIND_DISTRIBUTION, STATE_PENDING)
+            continue
+
+        logger.info(
+            "Retransfer {} orbit {}: frame statistics from {}, pass window "
+            "from {}".format(satellite, orbit, acq_folder, joined)
+        )
+        eof_filename = generate_report(metadata, in_dir, station_id, logger)
+        for folder_name in folder_names:
+            index_row(rows, folder_name, satellite, orbit,
+                      KIND_DISTRIBUTION, STATE_DONE, eof_filename)
+        generated += 1
+
+    return generated
 
 
 def run(config, dry_run=False, logger=None):
@@ -521,43 +757,47 @@ def run(config, dry_run=False, logger=None):
     if dry_run:
         logger.info("*** DRY-RUN MODE ***")
 
-    # Load processed folders (purges entries > 3 days)
-    processed = load_processed_folders(processed_file, logger)
-    logger.debug(
-        "Loaded {} processed folder entries".format(len(processed))
-    )
+    rows = load_index(processed_file, reports_source, logger)
+    logger.debug("Loaded {} index row(s)".format(len(rows)))
 
-    # Scan for new acquisition folders
-    new_folders = scan_acquisition_folders(reports_source, processed, logger)
-
-    if not new_folders:
-        logger.info("No new acquisition folders found.")
-        save_processed_folders(processed_file, processed)
+    folders = scan_acquisition_folders(reports_source, rows, logger)
+    if not folders:
+        logger.info("No folders to examine.")
+        if not dry_run:
+            save_index(processed_file, rows)
         return 0
 
-    logger.info("Found {} new folder(s)".format(len(new_folders)))
+    logger.info("Examining {} folder(s)".format(len(folders)))
+
+    # Classify everything up front. A retransfer that turns up in the same scan
+    # as its acquisition must still find it, so every acquisition is indexed
+    # before any retransfer is resolved.
+    classified = [(path, classify_folder(path)) for path in folders]
 
     generated_count = 0
-    for folder_path in new_folders:
+
+    for folder_path, info in classified:
         folder_name = os.path.basename(folder_path)
-
-        if dry_run:
-            logger.info("  Would process: {}".format(folder_name))
+        if info['kind'] == KIND_DISTRIBUTION:
             continue
-
-        eof_filename = process_folder(
-            folder_path, in_dir, station_id, logger
-        )
-        if eof_filename:
-            mark_as_processed(processed, folder_name)
-            generated_count += 1
-        else:
-            logger.warning(
-                "  Skipping {} due to errors".format(folder_name)
+        if info['kind'] == KIND_UNKNOWN:
+            # Most likely still being written — stay quiet and look again later.
+            logger.debug(
+                "Nothing recognisable yet in {}".format(folder_name)
             )
+            index_row(rows, folder_name, kind=KIND_UNKNOWN,
+                      state=STATE_PENDING)
+            continue
+        generated_count += _handle_acquisition_side(
+            folder_path, info, rows, in_dir, station_id, dry_run, logger
+        )
 
-    # Save updated processed folders list
-    save_processed_folders(processed_file, processed)
+    generated_count += _handle_retransfers(
+        classified, rows, reports_source, in_dir, station_id, dry_run, logger
+    )
+
+    if not dry_run:
+        save_index(processed_file, rows)
 
     logger.info(
         "Report Generator — Finished ({} file(s) generated)".format(
